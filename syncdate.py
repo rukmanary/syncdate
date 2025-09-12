@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# rstoredate v2.1.0
+# rstoredate v2.1.2
 # Default: UPDATE embedded metadata (EXIF/QuickTime) + filesystem timestamps.
-# Fix: no UTC conversion; sync uses -TagsFromFile (preserves timezone offset).
+# Sync mode: copy metadata AS-IS + copy filesystem timestamps EXACTLY from source (prevents time shifts).
 
 import argparse, json, os, shutil, subprocess, sys
 from pathlib import Path
@@ -9,7 +9,7 @@ from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
 
 APP_NAME = "rstoredate"
-VERSION = "2.1.0"
+VERSION = "2.1.1"
 
 class Colors:
     RESET  = "\033[0m"
@@ -31,6 +31,7 @@ def c(text: str, color: str) -> str:
         return f"{color}{text}{Colors.RESET}"
     return text
 
+# ----- Tag priorities -----
 VIDEO_TAG_PRIORITY = [
     "QuickTime:CreationDate",
     "QuickTime:CreateDate",
@@ -41,6 +42,8 @@ VIDEO_TAG_PRIORITY = [
     "EXIF:DateTimeOriginal",
     "XMP:CreateDate",
     "XMP:DateCreated",
+    "ItemList:ContentCreateDate",  # terkadang dipakai Photos/iOS
+    "Keys:CreationDate",
 ]
 PHOTO_TAG_PRIORITY = [
     "EXIF:DateTimeOriginal",
@@ -63,19 +66,22 @@ def ensure_exiftool():
         sys.stderr.write(c("ERROR: 'exiftool' not found in PATH.\n", Colors.RED))
         sys.exit(1)
 
+# IMPORTANT: do NOT use -api QuickTimeUTC=1 (preserve original timezone offsets)
 def exiftool_json(path: Path) -> Dict[str,str]:
-    # IMPORTANT: NO QuickTimeUTC=1 here; preserve original timezone offsets.
     cmd = ["exiftool","-a","-G1","-s","-time:all","-j",str(path)]
     out = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
     data = json.loads(out.decode("utf-8", errors="ignore"))
     return data[0] if data else {}
 
 def pick_best_time_tag(tags: Dict[str,str], path: Path) -> Optional[Tuple[str,str]]:
-    priority = VIDEO_TAG_PRIORITY if is_video(path) else PHOTO_TAG_PRIORITY if is_photo(path) else (VIDEO_TAG_PRIORITY+PHOTO_TAG_PRIORITY)
-    seen = set(); merged=[]
+    if is_video(path): priority = VIDEO_TAG_PRIORITY
+    elif is_photo(path): priority = PHOTO_TAG_PRIORITY
+    else: priority = VIDEO_TAG_PRIORITY + PHOTO_TAG_PRIORITY
+    seen=set(); ordered=[]
     for t in priority:
-        if t not in seen: seen.add(t); merged.append(t)
-    for tag in merged:
+        if t not in seen:
+            seen.add(t); ordered.append(t)
+    for tag in ordered:
         if tag in tags and str(tags[tag]).strip():
             return tag, str(tags[tag]).strip()
     for k,v in tags.items():
@@ -83,6 +89,7 @@ def pick_best_time_tag(tags: Dict[str,str], path: Path) -> Optional[Tuple[str,st
             return k, str(v).strip()
     return None
 
+# ----- Writers -----
 def set_metadata_dates_from_value(path: Path, value: str) -> Tuple[bool,str]:
     if is_photo(path):
         args = ["-overwrite_original",
@@ -98,6 +105,9 @@ def set_metadata_dates_from_value(path: Path, value: str) -> Tuple[bool,str]:
                 f"-TrackCreateDate={value}",
                 f"-TrackModifyDate={value}",
                 f"-ModifyDate={value}",
+                # optional common tags some tools consult:
+                f"-ItemList:ContentCreateDate={value}",
+                f"-Keys:CreationDate={value}",
                 str(path)]
     try:
         out = subprocess.check_output(["exiftool", *args], stderr=subprocess.STDOUT)
@@ -108,26 +118,29 @@ def set_metadata_dates_from_value(path: Path, value: str) -> Tuple[bool,str]:
 def set_filesystem_dates_from_value(path: Path, value: str) -> Tuple[bool,str]:
     try:
         out = subprocess.check_output(
-            ["exiftool","-overwrite_original",f"-FileCreateDate={value}",f"-FileModifyDate={value}",str(path)],
+            ["exiftool","-overwrite_original",
+             f"-FileCreateDate={value}", f"-FileModifyDate={value}", str(path)],
             stderr=subprocess.STDOUT)
         return True, out.decode("utf-8", errors="ignore").strip()
     except subprocess.CalledProcessError as e:
         msg = e.output.decode(errors="ignore")
         try:
             out2 = subprocess.check_output(
-                ["exiftool","-overwrite_original",f"-FileModifyDate={value}",str(path)],
+                ["exiftool","-overwrite_original",
+                 f"-FileModifyDate={value}", str(path)],
                 stderr=subprocess.STDOUT)
             return True, "(create date unsupported) " + out2.decode("utf-8", errors="ignore").strip()
         except subprocess.CalledProcessError as e2:
             return False, msg + "\n" + e2.output.decode(errors="ignore")
 
+# ----- Restore from own metadata -----
 def restore_from_own_metadata(path: Path) -> Tuple[str,bool,str]:
     try:
         tags = exiftool_json(path)
         picked = pick_best_time_tag(tags, path)
         if not picked:
             return (str(path), False, "No usable time tag found")
-        src_tag, value = picked  # value may include timezone offset (good)
+        src_tag, value = picked  # keep any timezone offset
         ok1, m1 = set_metadata_dates_from_value(path, value)
         if not ok1:
             return (str(path), False, f"Set metadata failed from {src_tag}={value}: {m1}")
@@ -140,20 +153,26 @@ def restore_from_own_metadata(path: Path) -> Tuple[str,bool,str]:
     except Exception as e:
         return (str(path), False, f"Error: {e}")
 
-# --- SYNC: copy tags AS-IS (preserve timezone), then set FS from QuickTime:CreateDate ---
+# ----- SYNC: copy metadata + copy FS timestamps from source -----
 def sync_copy_metadata_from_src(src: Path, dst: Path) -> Tuple[bool,str]:
-    # Copy all relevant time tags AS-IS; explicitly disable UTC conversion by NOT passing QuickTimeUTC=1.
+    # Copy relevant time tags AS-IS; include common alternates used by Photos/players
     cmd = [
         "exiftool","-overwrite_original",
         "-TagsFromFile", str(src),
+        # QuickTime/Media/Track
         "-QuickTime:CreateDate>QuickTime:CreateDate",
         "-QuickTime:ModifyDate>QuickTime:ModifyDate",
         "-MediaCreateDate>MediaCreateDate",
         "-TrackCreateDate>TrackCreateDate",
         "-TrackModifyDate>TrackModifyDate",
+        # EXIF (if present)
         "-EXIF:CreateDate>CreateDate",
         "-EXIF:DateTimeOriginal>DateTimeOriginal",
         "-EXIF:ModifyDate>ModifyDate",
+        # iTunes/ItemList & Keys (seen in some MOV/MP4)
+        "-ItemList:ContentCreateDate>ItemList:ContentCreateDate",
+        "-Keys:CreationDate>Keys:CreationDate",
+        "-UserData:CreationDate>UserData:CreationDate",
         str(dst),
     ]
     try:
@@ -162,34 +181,38 @@ def sync_copy_metadata_from_src(src: Path, dst: Path) -> Tuple[bool,str]:
     except subprocess.CalledProcessError as e:
         return False, e.output.decode(errors="ignore")
 
-def set_fs_from_quicktime_or_value(dst: Path) -> Tuple[bool,str]:
-    # Prefer QuickTime:CreateDate -> FS; if absent, fall back to best tag value.
+def sync_copy_filesystem_dates_from_src(src: Path, dst: Path) -> Tuple[bool,str]:
+    # Copy FS dates exactly from source; if create time unsupported, fall back to modify only
     try:
-        # this will fail if QT:CreateDate absent; we'll fall back below
         out = subprocess.check_output(
             ["exiftool","-overwrite_original",
-             "-FileCreateDate<QuickTime:CreateDate",
-             "-FileModifyDate<QuickTime:CreateDate",
+             "-TagsFromFile", str(src),
+             "-FileCreateDate<FileCreateDate",
+             "-FileModifyDate<FileModifyDate",
              str(dst)],
             stderr=subprocess.STDOUT)
         return True, out.decode("utf-8","ignore").strip()
-    except subprocess.CalledProcessError:
-        # fallback: read best value and set FS from that value
-        tags = exiftool_json(dst)
-        picked = pick_best_time_tag(tags, dst)
-        if not picked:
-            return False, "No usable time tag after sync"
-        value = picked[1]
-        return set_filesystem_dates_from_value(dst, value)
+    except subprocess.CalledProcessError as e:
+        msg = e.output.decode(errors="ignore")
+        try:
+            out2 = subprocess.check_output(
+                ["exiftool","-overwrite_original",
+                 "-TagsFromFile", str(src),
+                 "-FileModifyDate<FileModifyDate",
+                 str(dst)],
+                stderr=subprocess.STDOUT)
+            return True, "(create date unsupported) " + out2.decode("utf-8","ignore").strip()
+        except subprocess.CalledProcessError as e2:
+            return False, msg + "\n" + e2.output.decode(errors="ignore")
 
 def sync_from_source(src: Path, dst: Path) -> Tuple[bool,str]:
     ok1, m1 = sync_copy_metadata_from_src(src, dst)
     if not ok1: return False, f"Copy metadata failed: {m1}"
-    ok2, m2 = set_fs_from_quicktime_or_value(dst)
-    if not ok2: return False, f"Set filesystem failed: {m2}"
-    return True, "Synced metadata (preserve TZ) + filesystem"
+    ok2, m2 = sync_copy_filesystem_dates_from_src(src, dst)
+    if not ok2: return False, f"Copy filesystem dates failed: {m2}"
+    return True, "Synced metadata + filesystem (exact copy)"
 
-# ----- helpers for discovery -----
+# ----- discovery helpers -----
 def expand_file_argument(arg: str) -> List[Path]:
     p = Path(arg)
     if p.suffix:
@@ -246,12 +269,12 @@ def build_parser() -> argparse.ArgumentParser:
         f"  {APP_NAME} --file /path/encoded/movie.mp4 --sync-date-from /path/originals/movie.mov\n"
         "Notes:\n"
         "  - Hidden files (prefix '.') are ignored.\n"
-        "  - This tool updates both embedded metadata and filesystem timestamps.\n"
-        "  - No UTC conversion is applied; timezone offsets are preserved.\n"
+        "  - This tool updates embedded metadata and filesystem timestamps.\n"
+        "  - Timezone offsets are preserved; no UTC conversion is applied.\n"
     )
     p = argparse.ArgumentParser(
         prog=APP_NAME,
-        description="Restore/sync media dates: updates embedded EXIF/QuickTime metadata AND filesystem timestamps (no UTC conversion).",
+        description="Restore/sync media dates: update embedded EXIF/QuickTime metadata AND filesystem timestamps (no UTC conversion).",
         epilog=epilog,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
