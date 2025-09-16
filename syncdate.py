@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-# rstoredate v2.2.0
-# Default: UPDATE embedded metadata (EXIF/QuickTime) + filesystem timestamps.
-# Sync mode: copy metadata AS-IS + copy filesystem timestamps EXACTLY from source (prevents time shifts).
-# New: --shift-hours (+/-N) to add/subtract hours from the chosen timestamp.
-#      --set-offset "+07:00" or "Z" to force a timezone suffix in metadata strings (optional).
+# rstoredate v2.2.1
+# Restore/sync media dates the right way.
+# - Restore mode: update embedded metadata (EXIF/QuickTime/XMP) from the file's own metadata, then set filesystem timestamps.
+#   * No fallback to System:* (FS) — if metadata missing, the file is skipped.
+# - Sync mode: copy metadata AS-IS from source + copy filesystem timestamps EXACTLY from source.
+# - Options: --shift-hours (+/-N) and --set-offset (+HH:MM or Z) to adjust/annotate timestamps.
+#
+# Requires: exiftool in PATH (or bundled). We call "exiftool" directly.
 
 import argparse, json, os, re, shutil, subprocess, sys
 from datetime import datetime, timedelta, timezone
@@ -12,8 +15,9 @@ from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
 
 APP_NAME = "rstoredate"
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 
+# ---------- Colors ----------
 class Colors:
     RESET  = "\033[0m"
     GREEN  = "\033[32m"
@@ -34,13 +38,13 @@ def c(text: str, color: str) -> str:
         return f"{color}{text}{Colors.RESET}"
     return text
 
-# ----- Tag priorities -----
+# ---------- Tag priorities ----------
 VIDEO_TAG_PRIORITY = [
     "QuickTime:CreationDate",
     "ItemList:ContentCreateDate",
     "Keys:CreationDate",
-    "EXIF:CreateDate",
     "EXIF:DateTimeOriginal",
+    "EXIF:CreateDate",
     "QuickTime:CreateDate",
     "QuickTime:MediaCreateDate",
     "QuickTime:TrackCreateDate",
@@ -64,12 +68,13 @@ def is_hidden(p: Path) -> bool: return p.name.startswith(".")
 def is_video(p: Path) -> bool:  return p.suffix.lower() in VIDEO_EXTS
 def is_photo(p: Path) -> bool:  return p.suffix.lower() in PHOTO_EXTS
 
+# ---------- ExifTool helpers ----------
 def ensure_exiftool():
     if shutil.which("exiftool") is None:
         sys.stderr.write(c("ERROR: 'exiftool' not found in PATH.\n", Colors.RED))
         sys.exit(1)
 
-# IMPORTANT: do NOT use -api QuickTimeUTC=1 (preserve original timezone offsets)
+# Do NOT use -api QuickTimeUTC=1; keep original TZ offsets intact.
 def exiftool_json(path: Path) -> Dict[str,str]:
     cmd = ["exiftool","-a","-G1","-s","-time:all","-j",str(path)]
     out = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
@@ -77,15 +82,9 @@ def exiftool_json(path: Path) -> Dict[str,str]:
     return data[0] if data else {}
 
 TZ_RE = re.compile(r'(Z|[+-]\d{2}:\d{2})$')
-DT_RE = re.compile(
-    r'^(\d{4}):(\d{2}):(\d{2})\s+(\d{2}):(\d{2}):(\d{2})(\.\d+)?(Z|[+-]\d{2}:\d{2})?$'
-)
+DT_RE = re.compile(r'^(\d{4}):(\d{2}):(\d{2})\s+(\d{2}):(\d{2}):(\d{2})(\.\d+)?(Z|[+-]\d{2}:\d{2})?$')
 
 def parse_exif_dt(s: str) -> Tuple[datetime, Optional[str], Optional[str]]:
-    """
-    Parse EXIF/QuickTime datetime string.
-    Returns (aware_or_naive_dt, frac, tz_suffix_str)
-    """
     m = DT_RE.match(s.strip())
     if not m:
         raise ValueError(f"Unsupported datetime format: {s}")
@@ -103,27 +102,20 @@ def parse_exif_dt(s: str) -> Tuple[datetime, Optional[str], Optional[str]]:
 def fmt_exif_dt(dt: datetime, frac: Optional[str], tz_suffix: Optional[str]) -> str:
     s = dt.strftime("%Y:%m:%d %H:%M:%S")
     if frac:
-        # keep original fractional seconds if present
-        s += frac
+        s += frac  # preserve fractional seconds if present
     if tz_suffix:
-        if tz_suffix == 'Z':
-            # ensure dt is in UTC for honesty; but we keep suffix as requested
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
         s += tz_suffix
     return s
 
 def apply_time_adjustments(value: str, shift_hours: float = 0.0, set_offset: Optional[str] = None) -> str:
     """
-    Add/sub hours and/or set timezone suffix (without converting the wall clock again).
-    - shift-hours: add/subtract hours to the wall clock.
+    Add/sub hours and/or set timezone suffix (without additional wall-clock conversion).
+    - shift-hours: adjust clock by N hours.
     - set-offset: force suffix "+HH:MM" or "Z"; does NOT additionally shift time.
     """
     dt, frac, tzs = parse_exif_dt(value)
-    # Shift wall clock
     if shift_hours and shift_hours != 0.0:
         dt = dt + timedelta(hours=float(shift_hours))
-    # Force suffix if requested
     if set_offset:
         so = set_offset.strip().upper()
         if so != 'Z' and not re.match(r'^[+-]\d{2}:\d{2}$', so):
@@ -131,34 +123,58 @@ def apply_time_adjustments(value: str, shift_hours: float = 0.0, set_offset: Opt
         tzs = so
     return fmt_exif_dt(dt, frac, tzs)
 
-def pick_best_time_tag(tags: Dict[str,str], path: Path) -> Optional[Tuple[str,str]]:
+def pick_best_time_tag(tags: Dict[str, str], path: Path, allow_system_fallback: bool = False) -> Optional[Tuple[str, str]]:
     """
-    Choose the best time tag, preferring those with timezone suffix.
-    Fallback to System:FileModifyDate if all candidates are naive.
+    Choose timestamp from *metadata* first. Only if allow_system_fallback=True and
+    metadata is missing, use System:FileModifyDate.
+    Priority:
+      1) metadata candidates (video/photo) that include explicit TZ suffix (…Z / …+HH:MM)
+      2) first metadata candidate with any value
+      3) (optional) System:FileModifyDate
+      4) last resort: any *CreateDate / DateTimeOriginal tag
     """
-    if is_video(path): base = VIDEO_TAG_PRIORITY.copy()
-    elif is_photo(path): base = PHOTO_TAG_PRIORITY.copy()
-    else: base = VIDEO_TAG_PRIORITY + PHOTO_TAG_PRIORITY
-    base += ["System:FileModifyDate"]
+    if is_video(path):
+        base = [
+            "QuickTime:CreationDate",
+            "ItemList:ContentCreateDate",
+            "Keys:CreationDate",
+            "EXIF:DateTimeOriginal","EXIF:CreateDate",
+            "QuickTime:CreateDate","QuickTime:MediaCreateDate","QuickTime:TrackCreateDate",
+            "XMP:CreateDate","XMP:DateCreated",
+            "H264:DateTimeOriginal",
+        ]
+    elif is_photo(path):
+        base = [
+            "EXIF:DateTimeOriginal","EXIF:CreateDate",
+            "XMP:CreateDate","XMP:DateCreated",
+            "QuickTime:CreationDate",
+            "PNG:CreationTime",
+        ]
+    else:
+        base = [
+            "EXIF:DateTimeOriginal","EXIF:CreateDate",
+            "QuickTime:CreationDate","QuickTime:CreateDate",
+            "XMP:CreateDate","XMP:DateCreated",
+        ]
 
-    candidates = []
-    for tag in base:
-        if tag in tags and str(tags[tag]).strip():
-            candidates.append((tag, str(tags[tag]).strip()))
-    # prefer ones with explicit TZ
-    for tag, val in candidates:
+    meta_candidates = [(t, str(tags[t]).strip()) for t in base if t in tags and str(tags[t]).strip()]
+    # 1) prefer metadata with explicit TZ
+    for tag, val in meta_candidates:
         if TZ_RE.search(val):
             return tag, val
-    # fallback any
-    if candidates:
-        return candidates[0]
-    # last resort: scan all
+    # 2) else first metadata candidate
+    if meta_candidates:
+        return meta_candidates[0]
+    # 3) optionally fall back to System:FileModifyDate
+    if allow_system_fallback and "System:FileModifyDate" in tags and str(tags["System:FileModifyDate"]).strip():
+        return "System:FileModifyDate", str(tags["System:FileModifyDate"]).strip()
+    # 4) last resort scan
     for k, v in tags.items():
         if (k.endswith("CreateDate") or k.endswith("DateTimeOriginal")) and str(v).strip():
             return k, str(v).strip()
     return None
 
-# ----- Writers -----
+# ---------- Writers ----------
 def set_metadata_dates_from_value(path: Path, value: str) -> Tuple[bool,str]:
     if is_photo(path):
         args = ["-overwrite_original",
@@ -201,14 +217,14 @@ def set_filesystem_dates_from_value(path: Path, value: str) -> Tuple[bool,str]:
         except subprocess.CalledProcessError as e2:
             return False, msg + "\n" + e2.output.decode(errors="ignore")
 
-# ----- Restore from own metadata -----
+# ---------- Restore mode ----------
 def restore_from_own_metadata(path: Path, shift_hours: float, set_offset: Optional[str]) -> Tuple[str,bool,str]:
     try:
         tags = exiftool_json(path)
-        picked = pick_best_time_tag(tags, path)
+        picked = pick_best_time_tag(tags, path, allow_system_fallback=False)  # IMPORTANT
         if not picked:
-            return (str(path), False, "No usable time tag found")
-        src_tag, value = picked  # keep any timezone offset
+            return (str(path), False, "No usable metadata date (EXIF/QuickTime/XMP)")
+        src_tag, value = picked
         adj = apply_time_adjustments(value, shift_hours, set_offset)
         ok1, m1 = set_metadata_dates_from_value(path, adj)
         if not ok1:
@@ -222,19 +238,22 @@ def restore_from_own_metadata(path: Path, shift_hours: float, set_offset: Option
     except Exception as e:
         return (str(path), False, f"Error: {e}")
 
-# ----- SYNC: copy metadata + copy FS timestamps from source; optional shift afterward -----
+# ---------- Sync mode ----------
 def sync_copy_metadata_from_src(src: Path, dst: Path) -> Tuple[bool,str]:
     cmd = [
         "exiftool","-overwrite_original",
         "-TagsFromFile", str(src),
+        # QuickTime/Media/Track
         "-QuickTime:CreateDate>QuickTime:CreateDate",
         "-QuickTime:ModifyDate>QuickTime:ModifyDate",
         "-MediaCreateDate>MediaCreateDate",
         "-TrackCreateDate>TrackCreateDate",
         "-TrackModifyDate>TrackModifyDate",
+        # EXIF (images / some videos)
         "-EXIF:CreateDate>CreateDate",
         "-EXIF:DateTimeOriginal>DateTimeOriginal",
         "-EXIF:ModifyDate>ModifyDate",
+        # ItemList/Keys used by some tools
         "-ItemList:ContentCreateDate>ItemList:ContentCreateDate",
         "-Keys:CreationDate>Keys:CreationDate",
         "-UserData:CreationDate>UserData:CreationDate",
@@ -274,12 +293,12 @@ def sync_from_source(src: Path, dst: Path, shift_hours: float, set_offset: Optio
     if not ok1: return False, f"Copy metadata failed: {m1}"
     ok2, m2 = sync_copy_filesystem_dates_from_src(src, dst)
     if not ok2: return False, f"Copy filesystem dates failed: {m2}"
-    # If user asked to shift/offset, apply after copy (override both metadata & FS)
+    # Optional post-adjustment (apply to both metadata & FS)
     if (shift_hours and shift_hours != 0.0) or set_offset:
         tags = exiftool_json(dst)
-        picked = pick_best_time_tag(tags, dst)
+        picked = pick_best_time_tag(tags, dst, allow_system_fallback=False)
         if not picked:
-            return False, "Post-sync shift requested but no usable time tag found"
+            return False, "Post-sync shift requested but no usable metadata date found"
         _, value = picked
         adj = apply_time_adjustments(value, shift_hours, set_offset)
         okm, _ = set_metadata_dates_from_value(dst, adj)
@@ -289,7 +308,7 @@ def sync_from_source(src: Path, dst: Path, shift_hours: float, set_offset: Optio
         return True, f"Synced then shifted -> {adj}"
     return True, "Synced metadata + filesystem (exact copy)"
 
-# ----- discovery helpers -----
+# ---------- Discovery ----------
 def expand_file_argument(arg: str) -> List[Path]:
     p = Path(arg)
     if p.suffix:
@@ -336,7 +355,7 @@ def find_source_match(index, target: Path, case_insensitive: bool) -> Optional[P
             if lst: return lst[0]
     return None
 
-# ----- CLI -----
+# ---------- CLI ----------
 def build_parser() -> argparse.ArgumentParser:
     epilog = (
         "Examples:\n"
@@ -344,11 +363,13 @@ def build_parser() -> argparse.ArgumentParser:
         f"  {APP_NAME} --folder /path/media --recursive\n"
         f"  {APP_NAME} --folder /path/encoded --sync-date-from /path/originals\n"
         f"  {APP_NAME} --file /path/encoded/movie.mp4 --sync-date-from /path/originals/movie.mov\n"
-        f"  # with timezone fix (e.g., add 7 hours and set explicit +07:00 suffix)\n"
+        f"  # timezone fix: add 7 hours and add explicit +07:00 suffix\n"
         f"  {APP_NAME} --folder /path/media --shift-hours 7 --set-offset +07:00\n"
-        "Notes:\n"
+        "\nNotes:\n"
         "  - Hidden files (prefix '.') are ignored.\n"
         "  - This tool updates embedded metadata and filesystem timestamps.\n"
+        "  - Restore mode uses only metadata dates (no System:* fallback).\n"
+        "  - Sync mode copies metadata and filesystem timestamps exactly from the source.\n"
         "  - Timezone offsets are preserved; no UTC conversion is applied unless you set --set-offset.\n"
     )
     p = argparse.ArgumentParser(
@@ -369,7 +390,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="When syncing from a source folder, search recursively (default: true). Use --no-src-recursive to disable.")
     p.add_argument("--case-insensitive", dest="case_insensitive", action=argparse.BooleanOptionalAction, default=True,
                    help="Case-insensitive basename matching when syncing (default: true). Use --no-case-insensitive to disable.")
-    # New knobs:
+    # Adjustments
     p.add_argument("--shift-hours", dest="shift_hours", type=float, default=0.0,
                    help="Add/subtract hours to the chosen timestamp before writing (e.g., 7 or -7).")
     p.add_argument("--set-offset", dest="set_offset", default=None,
@@ -381,6 +402,7 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     sync_mode = args.sync_from is not None
 
+    # Build target list
     if args.file:
         targets = expand_file_argument(args.file)
         if not targets:
@@ -394,6 +416,7 @@ def main(argv=None):
     if not targets:
         print(c("[INFO] Nothing to do.", Colors.YELLOW)); return
 
+    # Prepare sync sources
     src_index = None; src_file = None; src_folder = None
     if sync_mode:
         src = Path(args.sync_from)
